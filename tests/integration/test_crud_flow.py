@@ -3,13 +3,14 @@
 import pytest
 from pytestqt.qt_compat import qt_api
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QApplication, QMessageBox # For mocking
+from PyQt6.QtWidgets import QApplication, QMessageBox, QDialogButtonBox # For mocking
 from pathlib import Path
 import time
 
-# Assuming the project root is added to PYTHONPATH or tests are run from root
-from gui import MainWindow, AddEditDialog
-from data_manager import save_data, load_data, DEFAULT_VAULT_PATH
+# Import from the package
+from lcg_password_manager.gui import MainWindow, AddEditDialog
+from lcg_password_manager.data_manager import save_data, load_data, DEFAULT_VAULT_PATH
+import lcg_password_manager.gui as gui
 
 # --- Test Fixtures --- 
 

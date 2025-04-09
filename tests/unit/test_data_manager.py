@@ -5,9 +5,9 @@ import json
 from pathlib import Path
 import os
 
-# Assuming the project root is added to PYTHONPATH or tests are run from root
-from data_manager import save_data, load_data, vault_exists
-from encryption_utils import SALT_SIZE
+# Import from the package
+from lcg_password_manager.data_manager import save_data, load_data, vault_exists
+from lcg_password_manager.encryption_utils import SALT_SIZE, generate_key, generate_salt, encrypt_data
 
 # --- Test Fixtures --- 
 
@@ -131,7 +131,6 @@ def test_load_corrupted_data(temp_vault_path: Path, sample_data: list, sample_pa
 def test_load_not_json(temp_vault_path: Path, sample_password: str):
     """Test load_data raises error if decrypted data isn't valid JSON or not a list."""
     # Use encryption utils directly to create a vault with non-JSON data
-    from encryption_utils import generate_key, generate_salt, encrypt_data
     salt = generate_salt()
     key = generate_key(sample_password, salt)
     non_json_bytes = b"this is not json data \x00\xff"
