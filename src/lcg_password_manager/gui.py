@@ -34,12 +34,11 @@ from PySide6.QtWidgets import (
     QProgressBar, # Added for strength meter
     QStackedWidget, # Added QStackedWidget
     QStyle, # Added for standard icons
-    QMainWindow
+    QMainWindow, QTableWidget, QTableWidgetItem, QStatusBar, QMenuBar, QMenu, QFormLayout, QToolBar, QTableView, QAbstractItemView, QFileDialog, QGroupBox, QTextEdit, QHeaderView, QSizePolicy, QTextBrowser, QScrollArea # Added QTextEdit and QHeaderView
 )
-from PySide6.QtCore import Qt, Signal, QTimer, QEvent # Changed pyqtSignal to Signal, added QTimer and QEvent
-from PySide6.QtGui import QClipboard, QPalette, QColor, QIcon # Added Palette/Color, QIcon
+from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QSortFilterProxyModel, QModelIndex, QDateTime, QPoint # Added QPoint for menu positioning
+from PySide6.QtGui import QAction, QClipboard, QPalette, QColor, QIcon, QPixmap, QKeySequence, QStandardItemModel, QStandardItem, QShortcut # Added QAction
 from . import data_manager
-from .data_manager import initialize_audit_logger, get_audit_logger
 from .encryption_utils import generate_salt
 import secrets # Added for password generation
 import string # Added for character sets
@@ -52,6 +51,13 @@ from datetime import datetime
 import ctypes
 from ctypes import wintypes
 import sys
+from pathlib import Path
+from typing import Optional # Make sure Optional is imported
+from .branding import Branding
+from .data_manager import DataManager
+from .audit_logger import AuditLogger
+from .security_utils import SecurityUtils
+import markdown # For rendering markdown
 
 # Constants for Login Throttling
 MAX_LOGIN_ATTEMPTS = 5  # Maximum failed attempts before lockout
@@ -144,9 +150,12 @@ class SetupWindow(QWidget):
     """
     # Signal to indicate setup is complete, passing the master password
     setup_complete = Signal(str) # Changed pyqtSignal to Signal
+    # Add signal to request showing the login window again
+    show_login = Signal()
 
-    def __init__(self):
+    def __init__(self, data_manager: DataManager):
         super().__init__()
+        self.data_manager = data_manager
         self.setWindowTitle("LCG Password Manager - Setup")
         self.setGeometry(200, 200, 400, 250) # Increased height
 
@@ -185,6 +194,11 @@ class SetupWindow(QWidget):
         self.submit_button.clicked.connect(self.create_vault)
         self.submit_button.setEnabled(False) # Disabled until password is good enough
         layout.addWidget(self.submit_button)
+
+        # Add a back button
+        self.back_button = QPushButton("Back to Login")
+        self.back_button.clicked.connect(self.go_back_to_login)
+        layout.addWidget(self.back_button)
 
         self.setLayout(layout)
         self.update_strength_meter("") # Initial state
@@ -246,16 +260,30 @@ class SetupWindow(QWidget):
              return
 
         try:
-            # Create initial empty vault
-            data_manager.save_data([], password) 
-            QMessageBox.information(self, "Success", f"Vault created successfully at\n{data_manager.DEFAULT_VAULT_PATH}")
-            self.setup_complete.emit(password) # Emit signal with the new password
-            self.close() # Close setup window
+            # Create initial empty vault using the module-level function, passing the path
+            data_manager.save_data([], password, self.data_manager.vault_path)
+            
+            # Show success message with clear next steps
+            QMessageBox.information(
+                self, 
+                "Vault Created Successfully",
+                "Your secure password vault has been created!\n\n"
+                "You will now be returned to the login screen where you can\n"
+                "sign in with your new master password."
+            )
+            
+            # Go back to login screen
+            self.show_login.emit()
+            self.close()
+            
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to create vault: {e}")
 
+    def go_back_to_login(self):
+        self.show_login.emit()
+        self.close()
 
-class LoginWindow(QWidget):
+class LoginWindow(QDialog):
     """Window for logging in with the master password.
     
     Security:
@@ -265,931 +293,1497 @@ class LoginWindow(QWidget):
     - Audit logging of attempts
     """
     # Signal indicating successful login, passing loaded data and master password
-    login_successful = Signal(list, str) # Changed pyqtSignal to Signal
+    login_successful = Signal(list, str)
     # Signal to indicate user wants to go to setup
-    show_setup = Signal() # Changed pyqtSignal to Signal
+    show_setup = Signal()
     
-    def __init__(self):
+    def __init__(self, audit_logger: AuditLogger, data_manager: DataManager):
         super().__init__()
-        self.setWindowTitle("LCG Password Manager - Login")
-        self.setGeometry(200, 200, 350, 180) # Increased height for additional button
-
+        self.branding = Branding()
+        self.data_manager = data_manager
+        self.audit_logger = audit_logger
+        self.security_utils = SecurityUtils()
+        
+        self.setWindowTitle(self.branding.get_window_title())
+        self.setWindowIcon(self.branding.icon)
+        self.setStyleSheet(self.branding.get_stylesheet())
+        
+        self.setup_ui()
+        
+    def setup_ui(self):
+        """Set up the login interface."""
         layout = QVBoxLayout()
-
-        self.info_label = QLabel("Enter your master password to unlock the vault.")
-        layout.addWidget(self.info_label)
-
+        
+        # Add logo at higher resolution
+        logo_label = QLabel()
+        logo_pixmap = QPixmap(self.branding._logo_path)
+        scaled_logo = logo_pixmap.scaled(400, 400, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        logo_label.setPixmap(scaled_logo)
+        logo_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(logo_label)
+        
+        # Add welcome message
+        welcome_label = QLabel("Welcome to LCG Password Manager")
+        welcome_label.setStyleSheet("font-size: 24px; font-weight: bold; margin: 20px;")
+        welcome_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(welcome_label)
+        
+        # Add description
+        desc_label = QLabel("Please enter your master password to access your secure vault")
+        desc_label.setStyleSheet("font-size: 14px; color: #666; margin: 10px;")
+        desc_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(desc_label)
+        
+        # Password input
         self.password_input = QLineEdit()
-        self.password_input.setPlaceholderText("Master Password")
-        self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.password_input.returnPressed.connect(self.attempt_login) 
+        self.password_input.setEchoMode(QLineEdit.Password)
+        self.password_input.setPlaceholderText("Enter your master password")
+        self.password_input.setStyleSheet("""
+            QLineEdit {
+                padding: 12px;
+                border: 1px solid #ccc;
+                border-radius: 6px;
+                margin: 10px;
+                font-size: 14px;
+            }
+            QLineEdit:focus {
+                border: 2px solid #007bff;
+            }
+        """)
         layout.addWidget(self.password_input)
-
-        self.login_button = QPushButton("Unlock")
-        self.login_button.clicked.connect(self.attempt_login)
+        
+        # Login button
+        self.login_button = QPushButton("Login")
+        self.login_button.setStyleSheet("""
+            QPushButton {
+                background-color: #007bff;
+                color: white;
+                padding: 12px 24px;
+                border: none;
+                border-radius: 6px;
+                margin: 10px;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #0056b3;
+            }
+            QPushButton:pressed {
+                background-color: #004085;
+            }
+        """)
+        self.login_button.clicked.connect(self.handle_login)
         layout.addWidget(self.login_button)
         
-        # Add a link/button for first-time users
-        self.setup_button = QPushButton("First time? Create a new vault")
-        self.setup_button.setObjectName("setup_button") # Add object name for QSS
-        self.setup_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        # Add "Create Master Password" button
+        self.setup_button = QPushButton("First time? Create Master Password")
+        self.setup_button.setStyleSheet("""
+            QPushButton {
+                background-color: #28a745;
+                color: white;
+                padding: 12px 24px;
+                border: none;
+                border-radius: 6px;
+                margin: 10px;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #218838;
+            }
+            QPushButton:pressed {
+                background-color: #1e7e34;
+            }
+        """)
         self.setup_button.clicked.connect(self.go_to_setup)
         layout.addWidget(self.setup_button)
         
-        self.status_label = QLabel("") # For showing lockout status
-        layout.addWidget(self.status_label)
-
+        # Add "Forgot Password" link
+        forgot_pw_link = QLabel('<a href="#" style="color: #007bff; text-decoration: none;">Forgot your password?</a>')
+        forgot_pw_link.setStyleSheet("font-size: 14px; margin: 10px;")
+        forgot_pw_link.setOpenExternalLinks(False)
+        forgot_pw_link.linkActivated.connect(self.handle_forgot_password)
+        forgot_pw_link.setAlignment(Qt.AlignCenter)
+        layout.addWidget(forgot_pw_link)
+        
         self.setLayout(layout)
-        self.check_lockout_status() # Check if currently locked out on init
         
-    def go_to_setup(self):
-        """Emit signal to go to setup window and close this window."""
-        self.show_setup.emit()
-        self.close()
-
-    def check_lockout_status(self):
-        """Checks if the lockout duration is active and updates UI."""
-        global FAILED_ATTEMPTS
-        current_time = time.time()
-        if FAILED_ATTEMPTS["count"] >= MAX_LOGIN_ATTEMPTS:
-            time_since_last = current_time - FAILED_ATTEMPTS["last_attempt_time"]
-            if time_since_last < LOCKOUT_DURATION_SECONDS:
-                remaining_lockout = int(LOCKOUT_DURATION_SECONDS - time_since_last)
-                self.status_label.setText(f"Too many failed attempts. Try again in {remaining_lockout}s.")
-                self.password_input.setEnabled(False)
-                self.login_button.setEnabled(False)
-                self.setup_button.setEnabled(False) # Also disable setup button during lockout
-                # Reschedule check for when lockout should end
-                QTimer.singleShot(remaining_lockout * 1000 + 100, self.reset_lockout) # Check slightly after lockout ends
-                return True # Is locked out
-            else:
-                # Lockout expired, reset
-                self.reset_lockout()
-        return False # Not locked out
-
-    def reset_lockout(self):
-        """Resets the failed attempt counter and enables inputs."""
-        global FAILED_ATTEMPTS
-        print("Login lockout expired or reset.")
-        FAILED_ATTEMPTS["count"] = 0
-        FAILED_ATTEMPTS["last_attempt_time"] = 0
-        self.status_label.setText("")
-        self.password_input.setEnabled(True)
-        self.login_button.setEnabled(True)
-        self.setup_button.setEnabled(True) # Also re-enable setup button
-        self.password_input.setFocus()
-        
-    def attempt_login(self):
-        global FAILED_ATTEMPTS
-        current_time = time.time()
-        
-        # Check if currently locked out
-        if self.check_lockout_status():
-            return
-
+    def handle_login(self):
+        """Handle the login process."""
         password = self.password_input.text()
-        if not password:
-            QMessageBox.warning(self, "Input Error", "Please enter your master password.")
-            return
-
+        
         try:
-            # Initialize audit logger with the attempted password
-            initialize_audit_logger(password, generate_salt())
+            # Set the master password in DataManager
+            self.data_manager.set_master_password(password)
             
-            # Attempt to load data - this will fail if password is wrong
-            loaded_data = data_manager.load_data(password)
+            try:
+                # Load encrypted data
+                loaded_data = self.data_manager.load()
+                
+                # Log successful login
+                self.audit_logger.log_event("login", "success", "User logged in successfully")
+                
+                # Emit signal instead of calling show_main_window directly
+                self.login_successful.emit(loaded_data, password)
+                self.accept() # Close the dialog
+                
+            except ValueError:
+                # Log failed login attempt
+                self.audit_logger.log_event("login", "failure", "Invalid password attempt")
+                
+                # Show error message
+                QMessageBox.warning(
+                    self,
+                    "Login Failed",
+                    "The password you entered is incorrect. Please try again."
+                )
+                
+                # Clear password field
+                self.password_input.clear()
+                
+        except Exception as e:
+            # Log error
+            self.audit_logger.log_event("login", "error", str(e))
             
-            # Log successful login
-            get_audit_logger().log_event(
-                "LOGIN_SUCCESS",
-                "User successfully logged in",
-                sensitive=True
+            # Show error message
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"An error occurred during login: {str(e)}\n\n"
+                "Please try again."
             )
             
-            # Successful login - reset attempts and emit signal
-            self.reset_lockout()
-            self.login_successful.emit(loaded_data, password) 
-            self.close() 
-            
-        except ValueError as e:
-            # Log failed login attempt
-            try:
-                get_audit_logger().log_event(
-                    "LOGIN_FAILURE",
-                    f"Failed login attempt {FAILED_ATTEMPTS['count'] + 1} of {MAX_LOGIN_ATTEMPTS}",
-                    sensitive=True
-                )
-            except:
-                pass  # Ignore audit logging errors during failed login
-            
-            # Incorrect password or corrupt vault
-            error_msg = str(e)
-            FAILED_ATTEMPTS["count"] += 1
-            FAILED_ATTEMPTS["last_attempt_time"] = current_time
-            print(f"Login failed. Attempt {FAILED_ATTEMPTS['count']} of {MAX_LOGIN_ATTEMPTS}.")
-            
-            # Check if this might be a first-time user who hasn't set up a master password yet
-            if "Decryption failed" in error_msg and FAILED_ATTEMPTS["count"] == 1:
-                msg = QMessageBox()
-                msg.setIcon(QMessageBox.Icon.Question)
-                msg.setWindowTitle("First-time User?")
-                msg.setText("Are you setting up the password manager for the first time?")
-                msg.setInformativeText("If so, click 'Yes' to create a new vault.")
-                msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-                if msg.exec() == QMessageBox.StandardButton.Yes:
-                    self.go_to_setup()
-                    return
-                    
-            # Show error message
-            if FAILED_ATTEMPTS["count"] >= MAX_LOGIN_ATTEMPTS:
-                self.status_label.setText(f"Too many failed attempts. Try again in {LOCKOUT_DURATION_SECONDS}s.")
-                self.password_input.setEnabled(False)
-                self.login_button.setEnabled(False)
-                self.setup_button.setEnabled(False)
-                QTimer.singleShot(LOCKOUT_DURATION_SECONDS * 1000 + 100, self.reset_lockout)
-            else:
-                remaining = MAX_LOGIN_ATTEMPTS - FAILED_ATTEMPTS["count"]
-                self.status_label.setText(f"Invalid password. {remaining} attempts remaining.")
-                
+            # Clear password field
             self.password_input.clear()
-            self.password_input.setFocus()
+            
+    def handle_forgot_password(self):
+        """Handle the forgot password request."""
+        QMessageBox.information(
+            self,
+            "Password Recovery",
+            "For security reasons, the master password cannot be recovered directly.\n\n"
+            "Please contact your system administrator or security team for assistance."
+        )
+        
+    def go_to_setup(self):
+        """Emit signal to show the setup window."""
+        self.show_setup.emit()
+        self.hide()
 
 # --- Main Application Window ---
 class MainWindow(QMainWindow):
     LOCK_TIMEOUT_MS = 15 * 60 * 1000 # 15 minutes
 
-    def __init__(self, vault_data: list, master_password: str):
+    def __init__(self, audit_logger: AuditLogger, data_manager: DataManager, initial_data=None, master_password=None):
         super().__init__()
-        self.vault_data = vault_data
+        self.branding = Branding()
+        self.data_manager = data_manager
+        self.audit_logger = audit_logger
+        self.security_utils = SecurityUtils()
+        
+        # Store master password and initial data
         self.master_password = master_password
-        self._is_locked = False
-        self._selected_entry_index = -1 # Track selected index
-        self._secure_master_password = None
-        self._secure_vault_data = []
+        self.initial_data = initial_data or []
 
-        self.setWindowTitle("LCG Password Manager")
-        self.setGeometry(100, 100, 1200, 800)
+        # Set master password on the single DataManager instance
+        if self.master_password:
+             self.data_manager.set_master_password(self.master_password)
+
+        self.setWindowTitle(self.branding.get_window_title())
+        self.setWindowIcon(self.branding.icon)
+        self.setStyleSheet(self.branding.get_stylesheet())
         
-        # Initialize the UI
-        self.init_ui()
+        # Resize MainWindow to be closer to AddEditDialog size
+        self.setGeometry(150, 150, 700, 600) # Adjusted size
+
+        self.setup_ui()
+        self.setup_menu()
+        self.setup_status_bar()
         
-        # Set up auto-lock timer
-        self.auto_lock_timer = QTimer()
-        self.auto_lock_timer.timeout.connect(self.lock_vault)
-        self.auto_lock_timer.setSingleShot(True)
-        self.auto_lock_timer.start(300000)  # 5 minutes
+        # Load initial data if provided
+        if self.initial_data:
+            self.load_entries()
         
-        # Session management
-        self.session_start_time = time.time()
-        self.session_timeout = 3600  # 1 hour timeout
-        self.failed_attempts = 0
-        self.max_failed_attempts = 5
-        self.lockout_duration = 300  # 5 minutes
-        self.last_activity_time = time.time()
-        self.activity_timeout = 300  # 5 minutes inactivity timeout
+    def setup_ui(self):
+        """Set up the main user interface."""
+        # Create central widget
+        central_widget = QWidget()
+        central_widget.setObjectName("centralWidget")
+        self.setCentralWidget(central_widget)
+        layout = QVBoxLayout(central_widget)
         
-        # Setup activity timer
-        self.activity_timer = QTimer()
-        self.activity_timer.timeout.connect(self.check_session_timeout)
-        self.activity_timer.start(1000)  # Check every second
+        # Create toolbar
+        toolbar = QToolBar()
+        toolbar.setMovable(False)
+        self.addToolBar(toolbar)
         
-        # Install event filter for activity tracking
-        self.installEventFilter(self)
-
-        # Get standard icons
-        style = self.style()
-        copy_icon = style.standardIcon(QStyle.StandardPixmap.SP_FileDialogContentsView)
-        # add_icon = style.standardIcon(QStyle.StandardPixmap.SP_FileLinkIcon) # Using '+' text for now
-        delete_icon = style.standardIcon(QStyle.StandardPixmap.SP_TrashIcon)
-
-        # --- Main Stacked Widget for Lock Screen ---
-        self.main_stack = QStackedWidget()
-        outer_layout = QVBoxLayout(self) # Main window needs a layout
-        outer_layout.addWidget(self.main_stack)
-        outer_layout.setContentsMargins(0,0,0,0)
-
-        # --- Vault View Widget (Content for the main stack) ---
-        self.vault_widget = QWidget()
-        vault_layout = QVBoxLayout(self.vault_widget) # Vertical layout for vault view
-        vault_layout.setContentsMargins(10, 10, 10, 10) # Add some padding
-        vault_layout.setSpacing(10)
-
-        # -- Top Bar (Search and Add) --
-        top_bar_layout = QHBoxLayout()
-        self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Search vault...")
-        self.search_input.textChanged.connect(self.filter_entries)
-        top_bar_layout.addWidget(self.search_input, 1) # Search takes most space
-
-        self.add_button = QPushButton("+ Add") # Using text for now
-        self.add_button.setToolTip("Add a new password entry")
+        # Add buttons
+        self.add_button = QPushButton("Add Entry")
+        self.add_button.setAccessibleName("Add new password entry")
         self.add_button.clicked.connect(self.add_entry)
-        top_bar_layout.addWidget(self.add_button)
-        vault_layout.addLayout(top_bar_layout)
-
-        # -- Entry List --
-        self.entry_list_widget = QListWidget()
-        self.entry_list_widget.itemSelectionChanged.connect(self.display_entry_details)
-        vault_layout.addWidget(self.entry_list_widget, 1) # List takes available vertical space
-
-        # -- Details Pane (Initially Hidden) --
-        self.details_widget = QWidget()
-        details_layout = QVBoxLayout(self.details_widget)
-        details_layout.setContentsMargins(5, 5, 5, 5)
-        details_layout.setSpacing(8)
-
-        # Service
-        self.service_display = QLineEdit() # Using QLineEdit for consistent look
-        self.service_display.setReadOnly(True)
-        self.service_display.setPlaceholderText("Service Name")
-        details_layout.addWidget(QLabel("Service:"))
-        details_layout.addWidget(self.service_display)
-
-        # Username
-        details_layout.addWidget(QLabel("Username:"))
-        username_layout = QHBoxLayout()
-        self.username_display = QLineEdit()
-        self.username_display.setReadOnly(True)
-        self.username_display.setPlaceholderText("Username")
-        username_layout.addWidget(self.username_display, 1)
-        self.copy_user_button = QPushButton(copy_icon, "")
-        self.copy_user_button.setToolTip("Copy Username")
-        self.copy_user_button.clicked.connect(self.copy_username)
-        username_layout.addWidget(self.copy_user_button)
-        details_layout.addLayout(username_layout)
-
-        # Password
-        details_layout.addWidget(QLabel("Password:"))
-        password_layout = QHBoxLayout()
-        self.password_display = QLineEdit()
-        self.password_display.setReadOnly(True)
-        self.password_display.setEchoMode(QLineEdit.EchoMode.Password)
-        self.password_display.setPlaceholderText("Password")
-        password_layout.addWidget(self.password_display, 1)
-        self.copy_pass_button = QPushButton(copy_icon, "")
-        self.copy_pass_button.setToolTip("Copy Password")
-        self.copy_pass_button.clicked.connect(self.copy_password)
-        password_layout.addWidget(self.copy_pass_button)
-        self.show_hide_button = QPushButton("Show")
-        self.show_hide_button.setObjectName("show_hide_button") # Keep object name for QSS
-        self.show_hide_button.setCheckable(True)
-        self.show_hide_button.setToolTip("Show/Hide Password")
-        self.show_hide_button.toggled.connect(self.toggle_password_details_visibility)
-        password_layout.addWidget(self.show_hide_button)
-        details_layout.addLayout(password_layout)
-
-        details_layout.addStretch() # Push delete button down
-
-        # Delete Button
-        delete_layout = QHBoxLayout()
-        delete_layout.addStretch() # Push button to the right
-        self.delete_button = QPushButton(delete_icon, " Delete Entry")
-        self.delete_button.setToolTip("Delete the selected password entry")
+        self.add_button.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                       stop:0 #3A7AB3, stop:1 #245A8E);
+                color: white;
+                border: 1px solid #1A4268;
+                border-radius: 3px;
+                padding: 5px 10px;
+                font-weight: bold;
+                min-width: 70px;
+                margin: 1px 3px;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                       stop:0 #4A8AC3, stop:1 #346A9E);
+            }
+            QPushButton:pressed {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                       stop:0 #1A4268, stop:1 #163753);
+            }
+        """)
+        toolbar.addWidget(self.add_button)
+        
+        self.edit_button = QPushButton("Edit")
+        self.edit_button.setAccessibleName("Edit selected password entry")
+        self.edit_button.setEnabled(False)
+        self.edit_button.clicked.connect(self.edit_entry)
+        self.edit_button.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                       stop:0 #3A7AB3, stop:1 #245A8E);
+                color: white;
+                border: 1px solid #1A4268;
+                border-radius: 3px;
+                padding: 5px 10px;
+                font-weight: bold;
+                min-width: 70px;
+                margin: 1px 3px;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                       stop:0 #4A8AC3, stop:1 #346A9E);
+            }
+            QPushButton:pressed {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                       stop:0 #1A4268, stop:1 #163753);
+            }
+            QPushButton:disabled {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                       stop:0 #B0B0B0, stop:1 #909090);
+                color: #E0E0E0;
+                border: 1px solid #808080;
+            }
+        """)
+        toolbar.addWidget(self.edit_button)
+        
+        self.delete_button = QPushButton("Delete")
+        self.delete_button.setAccessibleName("Delete selected password entry")
+        self.delete_button.setEnabled(False)
         self.delete_button.clicked.connect(self.delete_entry)
-        # Add specific styling for delete button if needed (e.g., make it red)
-        # self.delete_button.setObjectName("delete_button")
-        delete_layout.addWidget(self.delete_button)
-        details_layout.addLayout(delete_layout)
-
-        self.details_widget.setVisible(False) # Start hidden
-        vault_layout.addWidget(self.details_widget) # Add details pane to the main layout
-
-        # Add vault view to stack
-        self.main_stack.addWidget(self.vault_widget)
-
-        # --- Lock Screen Widget (Remains the same) ---
-        self.lock_widget = QWidget()
-        lock_layout = QVBoxLayout(self.lock_widget)
-        # Add some padding and alignment for better look
-        lock_layout.setContentsMargins(50, 50, 50, 50)
-        lock_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lock_layout.setSpacing(15)
-
-        lock_layout.addStretch(1)
-        lock_label = QLabel("Vault Locked")
-        lock_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        # Optional: Make lock label font larger/bolder
-        # font = lock_label.font()
-        # font.setPointSize(14)
-        # font.setBold(True)
-        # lock_label.setFont(font)
-        lock_layout.addWidget(lock_label)
-
-        self.lock_password_input = QLineEdit()
-        self.lock_password_input.setPlaceholderText("Enter Master Password to Unlock")
-        self.lock_password_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.lock_password_input.returnPressed.connect(self.attempt_unlock)
-        lock_layout.addWidget(self.lock_password_input)
-
-        unlock_button = QPushButton("Unlock")
-        unlock_button.clicked.connect(self.attempt_unlock)
-        lock_layout.addWidget(unlock_button)
-        lock_layout.addStretch(2)
-
-        self.main_stack.addWidget(self.lock_widget)
-
-        # --- Auto Lock Timer (Remains the same) ---
-        self.lock_timer = QTimer(self)
-        self.lock_timer.setInterval(self.LOCK_TIMEOUT_MS)
-        self.lock_timer.timeout.connect(self.lock_vault)
-        self.lock_timer.start()
-
-        self.installEventFilter(self)
-
-        # Initial state
-        self.load_entries_into_list()
-        # self.update_button_states() # Now handled by clear/display details
-        self.main_stack.setCurrentWidget(self.vault_widget) # Start unlocked
-
-        # Log application start
-        audit_logger.info("Application started")
-
-    def eventFilter(self, obj, event):
-        """Track user activity for session management."""
-        if event.type() in (QEvent.MouseButtonPress, QEvent.KeyPress):
-            self.last_activity_time = time.time()
-        return super().eventFilter(obj, event)
-
-    def check_session_timeout(self):
-        """Check for session timeout and inactivity."""
-        current_time = time.time()
+        self.delete_button.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                       stop:0 #3A7AB3, stop:1 #245A8E);
+                color: white;
+                border: 1px solid #1A4268;
+                border-radius: 3px;
+                padding: 5px 10px;
+                font-weight: bold;
+                min-width: 70px;
+                margin: 1px 3px;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                       stop:0 #4A8AC3, stop:1 #346A9E);
+            }
+            QPushButton:pressed {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                       stop:0 #1A4268, stop:1 #163753);
+            }
+            QPushButton:disabled {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                       stop:0 #B0B0B0, stop:1 #909090);
+                color: #E0E0E0;
+                border: 1px solid #808080;
+            }
+        """)
+        toolbar.addWidget(self.delete_button)
         
-        # Check session timeout
-        if current_time - self.session_start_time > self.session_timeout:
-            self.lock_vault()
-            QMessageBox.warning(self, "Session Expired", 
-                              "Your session has expired. Please log in again.")
-            return
-            
-        # Check inactivity timeout
-        if current_time - self.last_activity_time > self.activity_timeout:
-            self.lock_vault()
-            QMessageBox.warning(self, "Auto-Lock", 
-                              "Vault locked due to inactivity.")
-            return
-
-    def increment_failed_attempts(self):
-        """Increment failed login attempts and handle lockout."""
-        self.failed_attempts += 1
-        if self.failed_attempts >= self.max_failed_attempts:
-            self.lockout_until = time.time() + self.lockout_duration
-            QMessageBox.warning(self, "Account Locked", 
-                              f"Too many failed attempts. Account locked for {self.lockout_duration//60} minutes.")
-            return True
-        return False
-
-    def reset_failed_attempts(self):
-        """Reset failed login attempts counter."""
-        self.failed_attempts = 0
-
-    def is_account_locked(self):
-        """Check if account is currently locked."""
-        if hasattr(self, 'lockout_until'):
-            if time.time() < self.lockout_until:
-                remaining = int(self.lockout_until - time.time())
-                QMessageBox.warning(self, "Account Locked", 
-                                  f"Account is locked. Please try again in {remaining} seconds.")
-                return True
-            else:
-                delattr(self, 'lockout_until')
-        return False
-
-    def lock_vault(self):
-        """Lock the vault and securely clear sensitive data."""
-        # Securely clear sensitive data
-        if self._secure_master_password:
-            self._secure_master_password.secure_clear()
-        self._secure_master_password = None
+        toolbar.addSeparator()
         
-        for entry in self._secure_vault_data:
-            entry.secure_clear()
-        self._secure_vault_data = []
+        # Add spacer to push import/export/settings to the right
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        toolbar.addWidget(spacer)
         
-        self.vault_data = []
-        self.session_start_time = time.time()
-        self.failed_attempts = 0
-        if hasattr(self, 'lockout_until'):
-            delattr(self, 'lockout_until')
-        self.clear_details()
-        self.load_entries_into_list()
+        # Create overflow menu button
+        self.overflow_button = QPushButton("More")
+        self.overflow_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowDown))
+        self.overflow_button.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                       stop:0 #3A7AB3, stop:1 #245A8E);
+                color: white;
+                border: 1px solid #1A4268;
+                border-radius: 3px;
+                padding: 5px 10px;
+                font-weight: bold;
+                min-width: 70px;
+                margin: 1px 3px;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                       stop:0 #4A8AC3, stop:1 #346A9E);
+            }
+            QPushButton:pressed {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                       stop:0 #1A4268, stop:1 #163753);
+            }
+        """)
+        toolbar.addWidget(self.overflow_button)
+        
+        # Create overflow menu
+        self.overflow_menu = QMenu(self)
+        
+        # Add Import action to overflow menu
+        import_action = QAction("Import Passwords", self)
+        import_action.triggered.connect(self.import_entries)
+        self.overflow_menu.addAction(import_action)
+        
+        # Add Export action to overflow menu
+        export_action = QAction("Export Passwords", self)
+        export_action.triggered.connect(self.export_entries)
+        self.overflow_menu.addAction(export_action)
+        
+        # Connect overflow button to show menu
+        self.overflow_button.clicked.connect(self.show_overflow_menu)
+        
+        # Settings button - make more prominent
+        self.settings_button = QPushButton("Settings")
+        self.settings_button.setAccessibleName("Open settings dialog")
+        self.settings_button.clicked.connect(self.show_settings)
+        # Using a simple gear icon from standard icons
+        self.settings_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogInfoView))
+        self.settings_button.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                       stop:0 #3A7AB3, stop:1 #245A8E);
+                color: white;
+                border: 1px solid #1A4268;
+                border-radius: 3px;
+                padding: 5px 10px;
+                font-weight: bold;
+                min-width: 80px;
+                margin: 1px 3px;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                       stop:0 #4A8AC3, stop:1 #346A9E);
+            }
+            QPushButton:pressed {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                       stop:0 #1A4268, stop:1 #163753);
+            }
+        """)
+        toolbar.addWidget(self.settings_button)
+        
+        # Create table widget
+        self.table = QTableWidget()
+        self.table.setColumnCount(5)  # Increased to 5 columns
+        self.table.setHorizontalHeaderLabels(["Service", "Username", "Password", "Created", "Modified"])
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        # Set all columns to stretch initially
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Stretch) 
+        self.table.itemDoubleClicked.connect(self.handle_double_click)
+        layout.addWidget(self.table)
+        
+        # Initialize clipboard timer
+        self.clipboard_timer = QTimer()
+        self.clipboard_timer.setSingleShot(True)
+        self.clipboard_timer.timeout.connect(self.clear_clipboard)
+        
+        # Set window size to 85% of original
+        self.setGeometry(150, 150, 595, 510)  # Reduced from 700x600
+        
+        # Reapply stylesheet and polish to ensure updates take effect
+        self.setStyleSheet(self.branding.get_stylesheet())
+        self.style().unpolish(self)
+        self.style().polish(self)
 
-    def attempt_unlock(self):
-        """Handle unlock attempt with secure memory handling."""
-        if self.is_account_locked():
-            audit_logger.warning("Unlock attempt while account locked")
-            return
+        # Now load entries and set initial status message
+        self.load_entries()
+        self.statusBar().showMessage("Ready")
+        
+    def setup_menu(self):
+        """Set up the application menu bar."""
+        menu_bar = self.menuBar()
+        
+        # File menu
+        file_menu = menu_bar.addMenu("&File")
+        
+        import_action = QAction("&Import Passwords...", self)
+        import_action.triggered.connect(self.import_entries)
+        file_menu.addAction(import_action)
+        
+        export_action = QAction("&Export Passwords...", self)
+        export_action.triggered.connect(self.export_entries)
+        file_menu.addAction(export_action)
+        
+        file_menu.addSeparator()
+        
+        exit_action = QAction("E&xit", self)
+        exit_action.setShortcut(QKeySequence.StandardKey.Quit)
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+        
+        # Edit menu
+        edit_menu = menu_bar.addMenu("&Edit")
+        
+        copy_username_action = QAction("Copy &Username", self)
+        copy_username_action.setShortcut(QKeySequence("Ctrl+U"))
+        copy_username_action.triggered.connect(self.copy_username)
+        edit_menu.addAction(copy_username_action)
+        
+        copy_password_action = QAction("Copy &Password", self)
+        copy_password_action.setShortcut(QKeySequence.StandardKey.Copy)
+        copy_password_action.triggered.connect(self.copy_password)
+        edit_menu.addAction(copy_password_action)
+        
+        edit_menu.addSeparator()
+        
+        add_action = QAction("&Add Entry...", self)
+        add_action.setShortcut(QKeySequence.StandardKey.New)
+        add_action.triggered.connect(self.add_entry)
+        edit_menu.addAction(add_action)
+        
+        edit_action = QAction("&Edit Entry...", self)
+        edit_action.triggered.connect(self.edit_entry)
+        edit_menu.addAction(edit_action)
+        
+        delete_action = QAction("&Delete Entry", self)
+        delete_action.setShortcut(QKeySequence.StandardKey.Delete)
+        delete_action.triggered.connect(self.delete_entry)
+        edit_menu.addAction(delete_action)
+        
+        # Add Theme submenu
+        edit_menu.addSeparator()
+        theme_menu = edit_menu.addMenu("&Themes")
+        
+        # Light theme action
+        light_theme_action = QAction("&Light Theme", self)
+        light_theme_action.triggered.connect(lambda: self.change_theme("light"))
+        light_theme_action.setCheckable(True)
+        light_theme_action.setChecked(self.branding.theme_manager.current_theme == "light")
+        theme_menu.addAction(light_theme_action)
+        
+        # Dark theme action
+        dark_theme_action = QAction("&Dark Theme", self)
+        dark_theme_action.triggered.connect(lambda: self.change_theme("dark"))
+        dark_theme_action.setCheckable(True)
+        dark_theme_action.setChecked(self.branding.theme_manager.current_theme == "dark")
+        theme_menu.addAction(dark_theme_action)
+        
+        # Store theme actions for toggling checked state
+        self.theme_actions = {
+            "light": light_theme_action,
+            "dark": dark_theme_action
+        }
+        
+        # Help menu
+        help_menu = menu_bar.addMenu("&Help")
+        
+        # Add View Help action
+        help_action = QAction("&View Help", self)
+        help_action.triggered.connect(self.show_help_dialog)
+        help_menu.addAction(help_action)
+
+        # Add Contact Support action
+        contact_action = QAction("&Contact Support", self)
+        contact_action.triggered.connect(self.show_contact_dialog)
+        help_menu.addAction(contact_action)
+
+        help_menu.addSeparator()
+
+        about_action = QAction("&About LCG Password Manager", self)
+        about_action.triggered.connect(self.show_about_dialog)
+        help_menu.addAction(about_action)
+        
+    def setup_status_bar(self):
+        """Set up the status bar."""
+        status_bar = QStatusBar()
+        self.setStatusBar(status_bar)
+        
+        # Add footer text
+        footer_label = QLabel(self.branding.get_footer_text())
+        status_bar.addPermanentWidget(footer_label)
+        
+    def load_entries(self):
+        """Load password entries into the table."""
+        self.table.setRowCount(0)
+        entries = self.data_manager.get_entries()
+        
+        default_date_str = QDateTime.currentDateTime().toString(Qt.ISODate)
+        
+        for entry in entries:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
             
-        password = self.lock_password_input.text()
-        if not password:
-            audit_logger.warning("Empty password attempt")
-            QMessageBox.warning(self, "Error", "Please enter your password.")
-            return
+            # Service
+            self.table.setItem(row, 0, QTableWidgetItem(entry['service']))
             
-        try:
-            # Store password securely
-            self._secure_master_password = SecureString(password)
-            # Clear password from input field
-            self.lock_password_input.clear()
+            # Username
+            self.table.setItem(row, 1, QTableWidgetItem(entry['username']))
             
-            # Load data with secure password
-            self.vault_data = data_manager.load_data(self._secure_master_password.get_value())
-            self._secure_vault_data = [SecureString(str(entry)) for entry in self.vault_data]
+            # Password (masked)
+            self.table.setItem(row, 2, QTableWidgetItem('••••••••'))
             
-            self.main_stack.setCurrentWidget(self.vault_widget)
-            self.load_entries_into_list()
-            self.reset_failed_attempts()
-            audit_logger.info("Successful unlock")
-        except Exception as e:
-            self.increment_failed_attempts()
-            audit_logger.warning(f"Failed unlock attempt: {str(e)}")
-            QMessageBox.critical(self, "Error", "Invalid password.")
-            # Clear secure data on failure
-            if self._secure_master_password:
-                self._secure_master_password.secure_clear()
-            self._secure_master_password = None
+            # Created date (formatted, with fallback)
+            created_date_str = entry.get('created_date', entry.get('modified_date', default_date_str))
+            created_date = QDateTime.fromString(created_date_str, Qt.ISODate)
+            self.table.setItem(row, 3, QTableWidgetItem(created_date.toString('MM/dd/yyyy')))
             
-    def load_entries_into_list(self):
-        """Populates the QListWidget with service names from vault_data."""
-        current_selection_index = self._selected_entry_index # Use stored index
-
-        self.entry_list_widget.clear()
-        new_selection_row = -1
-        for index, entry in enumerate(self.vault_data):
-            list_item = QListWidgetItem(entry.get('service', 'No Service Name'))
-            list_item.setData(Qt.ItemDataRole.UserRole, index)
-            self.entry_list_widget.addItem(list_item)
-            if index == current_selection_index:
-                new_selection_row = self.entry_list_widget.count() - 1
-
-        # Clear search bar and apply filter
-        # self.search_input.clear() # Don't clear search on reload
-        self.filter_entries() # Re-apply filter to show/hide correctly
-
-        # Try to restore selection
-        if new_selection_row != -1:
-            self.entry_list_widget.setCurrentRow(new_selection_row)
-        else:
-            # If no selection restored, ensure details are hidden
-            self.clear_details()
-
-        # If selection was restored, display_entry_details will be called by itemSelectionChanged
-        # If list is now empty, clear_details was called.
-
-    def filter_entries(self):
-        """Filters the list widget items based on the search input text."""
-        search_text = self.search_input.text().lower().strip()
-        current_selection_visible = False
-        selected_items = self.entry_list_widget.selectedItems()
-        current_selected_index = self._selected_entry_index
-
-        for i in range(self.entry_list_widget.count()):
-            item = self.entry_list_widget.item(i)
-            entry_index = item.data(Qt.ItemDataRole.UserRole)
-
-            if 0 <= entry_index < len(self.vault_data):
-                entry = self.vault_data[entry_index]
-                service = entry.get('service', '').lower()
-                username = entry.get('username', '').lower()
-
-                if search_text in service or search_text in username:
-                    item.setHidden(False)
-                    if entry_index == current_selected_index:
-                        current_selection_visible = True
-                else:
-                    item.setHidden(True)
-            else:
-                item.setHidden(True)
-
-        # If the previously selected item is now hidden, clear the details
-        if selected_items and not current_selection_visible:
-             self.entry_list_widget.clearSelection() # Deselect the hidden item
-             self.clear_details()
-
-    def display_entry_details(self):
-        """Updates the detail pane when an item is selected and makes it visible."""
-        selected_items = self.entry_list_widget.selectedItems()
-        if not selected_items:
-            # This can happen if selection is cleared programmatically
-            # We might already be hidden, but call clear_details just in case
-            # self.clear_details() # Avoid recursive loop if clearSelection triggers this
-            if self.details_widget.isVisible():
-                self.clear_details()
-            return
-
-        selected_item = selected_items[0]
-        entry_index = selected_item.data(Qt.ItemDataRole.UserRole)
-        self._selected_entry_index = entry_index # Store the selected index
-
-        entry = self._get_selected_entry_data()
-        if entry:
-            self.service_display.setText(entry.get('service', 'N/A'))
-            self.username_display.setText(entry.get('username', 'N/A'))
-            # Reset password view state
-            self.show_hide_button.setChecked(False) # Ensure button is "Show"
-            self.password_display.setText("********") # Use placeholder dots
-            self.password_display.setEchoMode(QLineEdit.EchoMode.Password) # Ensure hidden
-            self.show_hide_button.setText("Show")
-
-            # Make details visible and enable buttons
-            self.details_widget.setVisible(True)
-            self.update_button_states(True) # Pass True to indicate selection exists
-            # Add animation here later if desired
-        else:
-            # Handle potential index out of bounds or error
-            self.clear_details()
-
-    def clear_details(self):
-        """Clears the details display fields and hides the details pane."""
-        self.service_display.clear()
-        self.username_display.clear()
-        self.password_display.clear()
-        self.show_hide_button.setChecked(False)
-        self.show_hide_button.setText("Show")
-        self._selected_entry_index = -1 # Clear selected index tracker
-
-        self.details_widget.setVisible(False) # Hide the pane
-        self.update_button_states(False) # Pass False to indicate no selection
-        # Add animation here later if desired
-
-    def update_button_states(self, has_selection: bool):
-        """Enable/disable buttons in the details pane based on selection."""
-        # Add button is always enabled (unless locked, handled elsewhere)
-        # self.add_button.setEnabled(True)
-        # Buttons within the details pane depend on selection
-        self.delete_button.setEnabled(has_selection)
-        self.copy_user_button.setEnabled(has_selection)
-        self.copy_pass_button.setEnabled(has_selection)
-        self.show_hide_button.setEnabled(has_selection)
-
-    def toggle_password_details_visibility(self, checked):
-        """Toggles the visibility of the password in the details display QLineEdit."""
-        entry = self._get_selected_entry_data()
-        if not entry:
-             # Reset in case of weird state
-             self.password_display.setEchoMode(QLineEdit.EchoMode.Password)
-             self.password_display.setText("")
-             self.show_hide_button.setText("Show")
+            # Modified date (formatted)
+            modified_date_str = entry.get('modified_date', default_date_str)
+            modified_date = QDateTime.fromString(modified_date_str, Qt.ISODate)
+            self.table.setItem(row, 4, QTableWidgetItem(modified_date.toString('MM/dd/yyyy')))
+        
+        self.statusBar().showMessage(f"Loaded {len(entries)} entries")
+        self.audit_logger.log_event("ENTRIES_LOADED", f"Loaded {len(entries)} entries")
+        # Remove resizeColumnsToContents and setStretchLastSection as Stretch is set for all columns now
+        # self.table.resizeColumnsToContents()
+        # self.table.horizontalHeader().setStretchLastSection(True)
+        
+        # Connect selection changed signal after loading data
+        self.table.itemSelectionChanged.connect(self.update_button_states)
+        self.update_button_states() # Initial state check
+    
+    def add_entry(self):
+        """Show dialog to add a new password entry"""
+        dialog = AddEditDialog(self.data_manager, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            try:
+                entry = dialog.get_entry()
+                entry['modified_date'] = QDateTime.currentDateTime().toString(Qt.ISODate)
+                self.data_manager.add_entry(entry)
+                self.load_entries()
+                self.statusBar().showMessage("Entry added successfully")
+                self.audit_logger.log_event("ENTRY_ADD", f"Added entry for service: {entry['service']}")
+            except ValueError as e:
+                QMessageBox.warning(self, "Error Adding Entry", str(e))
+                self.audit_logger.log_event("ENTRY_ADD_ERROR", f"Failed to add entry for {entry.get('service', '?')}: {e}")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to add entry: {str(e)}")
+                self.audit_logger.log_event("ENTRY_ADD_ERROR", f"Failed to add entry: {str(e)}")
+    
+    def edit_entry(self):
+        """Show dialog to edit the selected password entry"""
+        selected_row_index = self._get_selected_source_row()
+        if selected_row_index is None:
+             QMessageBox.warning(self, "No Selection", "Please select an entry to edit.")
              return
 
-        if checked: # Button is checked -> Show password
-            password = entry.get('password', '')
-            self.password_display.setEchoMode(QLineEdit.EchoMode.Normal)
-            self.password_display.setText(password) # Display actual password
-            self.show_hide_button.setText("Hide")
-        else: # Button is unchecked -> Hide password
-            self.password_display.setEchoMode(QLineEdit.EchoMode.Password)
-            # Keep showing dots or clear, your preference. Dots might be better.
-            self.password_display.setText("********" if entry.get('password') else "")
-            self.show_hide_button.setText("Show")
-
-    # --- Button Action Methods ---
-    def add_entry(self):
-        """Add new entry with secure memory handling."""
-        dialog = AddEditDialog(parent=self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            new_entry = dialog.get_data()
-            if new_entry:
-                try:
-                    # Store sensitive data securely
-                    secure_entry = SecureString(str(new_entry))
-                    self._secure_vault_data.append(secure_entry)
-                    self.vault_data.append(new_entry)
-                    
-                    data_manager.save_data(self.vault_data, self._secure_master_password.get_value())
-                    audit_logger.info(f"Added new entry for service: {new_entry['service']}")
-                    new_index = len(self.vault_data) - 1
-                    self._selected_entry_index = new_index # Update selection tracker
-                    self.load_entries_into_list() # Refresh list
-                    # Select the newly added item visually
-                    self.entry_list_widget.setCurrentRow(self.entry_list_widget.count() - 1)
-                    # display_entry_details will be called by the selection change
-                    print("New entry added and saved.")
-                except Exception as e:
-                    audit_logger.error(f"Failed to add entry: {str(e)}")
-                    QMessageBox.critical(self, "Save Error", f"Failed to save the new entry: {e}")
-                    self.vault_data.pop()
-                    if self._secure_vault_data:
-                        self._secure_vault_data[-1].secure_clear()
-                        self._secure_vault_data.pop()
-                    
-    def delete_entry(self):
-        """Delete entry with audit logging."""
-        if self._selected_entry_index == -1:
-            audit_logger.warning("Delete attempt with no selection")
-            QMessageBox.warning(self, "Selection Error", "Please select an entry to delete.")
+        service_item = self.table.item(selected_row_index, 0)
+        username_item = self.table.item(selected_row_index, 1)
+        if not service_item or not username_item:
+            QMessageBox.warning(self, "Error", "Could not identify selected entry in model.")
             return
-            
-        entry_index_to_delete = self._selected_entry_index
-        entry_service = self.vault_data[entry_index_to_delete].get('service', 'this entry')
-        
-        reply = QMessageBox.question(self,
-                                   "Confirm Delete",
-                                   f"Are you sure you want to delete the entry for '{entry_service}'?",
-                                   QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                                   QMessageBox.StandardButton.No)
-                                   
+
+        service = service_item.text()
+        username = username_item.text()
+        old_key = {"service": service, "username": username}
+
+        try:
+            # Find the original entry in DataManager's data
+            entry = next((e for e in self.data_manager.get_entries() if e['service'] == service and e['username'] == username), None)
+            if not entry:
+                QMessageBox.warning(self, "Warning", "Entry data not found. Cannot edit.")
+                self.audit_logger.log_event("ENTRY_EDIT_ERROR", f"Entry data not found for {service} / {username}")
+                self.load_entries()
+                return
+
+            dialog = AddEditDialog(self.data_manager, self, entry=entry)
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                updated_entry = dialog.get_entry()
+                updated_entry['modified_date'] = QDateTime.currentDateTime().toString(Qt.ISODate)
+
+                self.data_manager.update_entry(old_key, updated_entry)
+                self.load_entries()
+                self.statusBar().showMessage("Entry updated successfully")
+                self.audit_logger.log_event("ENTRY_UPDATE", f"Updated entry for service: {service} / {username}")
+        except ValueError as e:
+            QMessageBox.warning(self, "Error Updating Entry", str(e))
+            self.audit_logger.log_event("ENTRY_UPDATE_ERROR", f"Failed to update entry for {service}: {str(e)}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to update entry: {str(e)}")
+            self.audit_logger.log_event("ENTRY_UPDATE_ERROR", f"Failed to update entry for {service}: {str(e)}")
+    
+    def delete_entry(self):
+        """Delete the selected password entry"""
+        selected_row_index = self._get_selected_source_row()
+        if selected_row_index is None:
+             QMessageBox.warning(self, "No Selection", "Please select an entry to delete.")
+             return
+
+        service_item = self.table.item(selected_row_index, 0)
+        username_item = self.table.item(selected_row_index, 1)
+        if not service_item or not username_item:
+            QMessageBox.warning(self, "Error", "Could not identify selected entry in model.")
+            return
+
+        service = service_item.text()
+        username = username_item.text()
+        key_to_delete = {"service": service, "username": username}
+
+        reply = QMessageBox.question(
+            self,
+            "Confirm Delete",
+            f"Are you sure you want to delete the entry for \"{service}\" / \"{username}\"?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+
         if reply == QMessageBox.StandardButton.Yes:
             try:
-                del self.vault_data[entry_index_to_delete]
-                data_manager.save_data(self.vault_data, self._secure_master_password.get_value())
-                audit_logger.info(f"Deleted entry for service: {entry_service}")
-                self.clear_details() # Hide details pane first
-                self._selected_entry_index = -1 # Reset selection index
-                self.load_entries_into_list() # Reload the list
-
-                print(f"Entry '{entry_service}' deleted and vault saved.")
+                self.data_manager.delete_entry(key_to_delete)
+                self.load_entries()
+                self.statusBar().showMessage("Entry deleted successfully")
+                self.audit_logger.log_event("ENTRY_DELETE", f"Deleted entry for {service} / {username}")
+            except ValueError as e:
+                QMessageBox.warning(self, "Error Deleting Entry", str(e))
+                self.audit_logger.log_event("ENTRY_DELETE_ERROR", f"Failed to delete entry {service} / {username}: {e}")
+                self.load_entries()
             except Exception as e:
-                audit_logger.error(f"Failed to delete entry: {str(e)}")
-                QMessageBox.critical(self, "Save Error", f"Failed to save vault after deletion: {e}")
-                
-    def _get_selected_entry_data(self):
-        """Helper method to get the data dictionary of the selected entry using the tracked index."""
-        if self._selected_entry_index != -1 and 0 <= self._selected_entry_index < len(self.vault_data):
-            return self.vault_data[self._selected_entry_index]
-        else:
-            # This might happen if data changes externally or after delete/add errors
-            # QMessageBox.warning(self, "Error", "Selected item index out of sync with data.")
-            print("Warning: _get_selected_entry_data called with invalid index.")
-            self._selected_entry_index = -1 # Reset index
-            self.clear_details() # Clear UI
-            return None
+                QMessageBox.critical(self, "Error", f"Failed to delete entry: {str(e)}")
+                self.audit_logger.log_event("ENTRY_DELETE_ERROR", f"Failed to delete entry {service} / {username}: {str(e)}")
+    
+    def copy_username(self, row=None):
+        """Copy username of selected entry to clipboard."""
+        if row is None:
+            row = self._get_selected_source_row()
+        if row is None:
+            return
 
-    def copy_username(self):
-        entry = self._get_selected_entry_data() # Gets based on _selected_entry_index
-        if entry:
-            username = entry.get('username', '') # Get actual data
-            if username:
+        username_item = self.table.item(row, 1)
+        if not username_item:
+            return
+        username = username_item.text()
+
+        # Use QApplication clipboard
+        clipboard = QApplication.clipboard()
+        clipboard.setText(username)
+
+        self.audit_logger.log_event("USERNAME_COPY", f"Copied username for: {self.table.item(row, 0).text()}")
+        self.statusBar().showMessage("Username copied to clipboard", 2000)
+
+    def copy_password(self, row=None):
+        """Copy password of selected entry to clipboard."""
+        if row is None:
+            row = self._get_selected_source_row()
+        if row is None:
+            return
+
+        service_item = self.table.item(row, 0)
+        username_item = self.table.item(row, 1)
+        if not service_item or not username_item:
+            return
+
+        service = service_item.text()
+        username = username_item.text()
+
+        try:
+            entry = next((e for e in self.data_manager.get_entries() if e['service'] == service and e['username'] == username), None)
+            if entry and 'password' in entry:
+                actual_password = entry['password']
+
+                # Use QApplication clipboard
                 clipboard = QApplication.clipboard()
-                clipboard.setText(username)
-                print(f"Copied username for {entry.get('service', 'N/A')}")
-                # Add visual feedback here (e.g., temporary button text change)
-                self.copy_user_button.setText("Copied!")
-                QTimer.singleShot(1500, lambda: self.copy_user_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogContentsView))) # Reset icon
-                QTimer.singleShot(1500, lambda: self.copy_user_button.setText(""))
+                clipboard.setText(actual_password)
+                
+                # Start the clipboard timer
+                self.clipboard_timer.start(15000)  # 15 seconds
+
+                self.audit_logger.log_event("PASSWORD_COPY", f"Copied password for: {service} - {username}")
+                self.statusBar().showMessage("Password copied. Clears in 15s.")
             else:
-                print("No username to copy for this entry.")
+                 QMessageBox.warning(self, "Error", "Could not retrieve password for selected entry.")
+                 self.audit_logger.log_event("PASSWORD_COPY_ERROR", f"Failed to retrieve password for {service} - {username}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error retrieving password: {e}")
+            self.audit_logger.log_event("PASSWORD_COPY_ERROR", f"Exception retrieving password for {service} - {username}: {e}")
 
-    def copy_password(self):
-        """Copy password with secure memory handling."""
-        entry = self._get_selected_entry_data()
-        if entry:
-            password = entry.get('password', '')
-            if password:
-                # Create temporary secure string for clipboard
-                secure_password = SecureString(password)
-                clipboard = QApplication.clipboard()
-                clipboard.setText(secure_password.get_value(), mode=QClipboard.Mode.Clipboard)
-                audit_logger.info(f"Password copied for service: {entry.get('service', 'N/A')}")
-                
-                # Clear secure string after copying
-                secure_password.secure_clear()
-                # ... rest of the existing code ...
-                
-    def closeEvent(self, event):
-        """Handle application close with secure cleanup."""
-        audit_logger.info("Application closing")
-        # Securely clear all sensitive data
-        self.lock_vault()
-        QApplication.quit()
+    def show_help_dialog(self):
+        """Show the help dialog with the user guide."""
+        dialog = HelpDialog(self)
+        dialog.exec()
 
+    def show_contact_dialog(self):
+        """Show contact information for support."""
+        QMessageBox.information(
+            self,
+            "Contact Support",
+            "For assistance, please contact:\n\n"
+            "Department: MATI Department\n"
+            "Email: ngrant@lcgadvisors.com"
+        )
+
+    def show_about_dialog(self):
+        """Show about dialog with application information."""
+        about_text = f"""
+        <h2>LCG Password Manager</h2>
+        <p>Version 1.0.0</p> # TODO: Get version dynamically
+        <p>Enterprise-grade password management solution.</p>
+        <p>{self.branding.get_footer_text()}</p>
+        """
+        QMessageBox.about(self, "About LCG Password Manager", about_text)
+        
+    def import_entries(self):
+        """Import password entries from a file"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import Entries",
+            "",
+            "JSON Files (*.json);;All Files (*.*)"
+        )
+        
+        if file_path:
+            try:
+                count = self.data_manager.import_entries(file_path)
+                self.load_entries()
+                self.statusBar().showMessage(f"Successfully imported {count} entries")
+                self.audit_logger.log_event("entries_imported", f"Imported {count} entries from file")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to import entries: {str(e)}")
+                self.audit_logger.log_event("error", f"Failed to import entries: {str(e)}")
+    
+    def export_entries(self):
+        """Export password entries to a file"""
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Entries",
+            "",
+            "JSON Files (*.json);;All Files (*.*)"
+        )
+        
+        if file_path:
+            try:
+                count = self.data_manager.export_entries(file_path)
+                self.statusBar().showMessage(f"Successfully exported {count} entries")
+                self.audit_logger.log_event("entries_exported", f"Exported {count} entries to file")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to export entries: {str(e)}")
+                self.audit_logger.log_event("error", f"Failed to export entries: {str(e)}")
+    
+    def show_settings(self):
+        """Show the settings dialog"""
+        dialog = SettingsDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.load_entries()  # Reload entries in case settings affect display
+            self.statusBar().showMessage("Settings updated successfully")
+            self.audit_logger.log_event("settings_updated", "Settings were updated")
+
+    def handle_double_click(self, item):
+        """Handle double click on table items."""
+        row = item.row()
+        column = item.column()
+        
+        if column == 0:  # Service column
+            self.edit_entry()
+        elif column == 2:  # Password column
+            self.copy_password(row)
+        elif column == 1:  # Username column
+            self.copy_username(row)
+
+    def _get_selected_source_row(self) -> Optional[int]:
+        """Helper to get the selected row index."""
+        selected_indexes = self.table.selectedIndexes()
+        if not selected_indexes:
+            return None
+        return selected_indexes[0].row()
+
+    def clear_clipboard(self):
+        """Clear the clipboard after timeout."""
+        clipboard = QApplication.clipboard()
+        clipboard.clear()
+        self.statusBar().showMessage("Clipboard cleared for security.", 3000)
+
+    def set_initial_data(self, data):
+        """Set the initial data (used after login/setup)."""
+        self.initial_data = data
+        # Don't load here, load_entries is called in __init__ if data exists
+
+    def update_button_states(self):
+        """Update button states based on selection"""
+        has_selection = len(self.table.selectedIndexes()) > 0
+        self.edit_button.setEnabled(has_selection)
+        self.delete_button.setEnabled(has_selection)
+        # Also update menu actions if they exist and need enabling/disabling
+
+    def show_overflow_menu(self):
+        """Show the overflow menu below the button."""
+        button_pos = self.overflow_button.mapToGlobal(QPoint(0, self.overflow_button.height()))
+        self.overflow_menu.exec(button_pos)
+
+    def change_theme(self, theme_name):
+        """Change the application theme."""
+        # Update theme manager
+        self.branding.theme_manager.current_theme = theme_name
+        
+        # Update checked state of theme actions
+        for name, action in self.theme_actions.items():
+            action.setChecked(name == theme_name)
+        
+        # Apply the new stylesheet
+        stylesheet = self.branding.get_stylesheet()
+        self.setStyleSheet(stylesheet)
+        
+        # Force repaint of the widgets
+        QApplication.instance().setStyleSheet(stylesheet)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+        QApplication.processEvents()
+        
+        # Update status bar
+        self.statusBar().showMessage(f"Theme changed to {theme_name.title()}", 2000)
+        
+        # Log theme change
+        self.audit_logger.log_event("THEME_CHANGED", f"Theme changed to {theme_name}")
 
 # --- Add/Edit Entry Dialog ---
 class AddEditDialog(QDialog):
-    """Dialog for adding or editing a password entry.
+    """Dialog for adding or editing password entries"""
     
-    Security:
-    - Cryptographically secure password generation
-    - Strong password enforcement
-    - Character pool separation
-    - Secure random number generation
-    """
-    def __init__(self, parent=None, entry=None):
+    def __init__(self, data_manager: DataManager, parent=None, entry=None):
         super().__init__(parent)
-        self.entry = entry # Store entry data if we are editing
-
-        self.setWindowTitle("Add New Entry" if entry is None else "Edit Entry")
-        self.setMinimumWidth(450) # Increased width slightly
-
-        layout = QVBoxLayout(self)
-
-        # Add password strength indicator
-        self.strength_label = QLabel("Password Strength: ")
-        self.strength_bar = QProgressBar()
-        self.strength_bar.setRange(0, 100)
-        self.strength_bar.setTextVisible(True)
-        self.strength_bar.setFormat("%p%")
+        self.data_manager = data_manager
+        self.entry = entry
+        self.security_utils = SecurityUtils()
+        self.setup_ui()
         
-        # Connect password input to strength checker
-        self.password_input.textChanged.connect(self.check_password_strength)
+    def setup_ui(self):
+        """Set up the dialog's user interface"""
+        self.setWindowTitle("Add Entry" if not self.entry else "Edit Entry")
+        self.setModal(True)
+        self.setMinimumWidth(600)
 
-        # Form Layout for labels and fields
-        form_layout = QVBoxLayout()
+        layout = QVBoxLayout()
+        form_layout = QFormLayout()
+        
+        # Service input
         self.service_input = QLineEdit()
-        self.service_input.setPlaceholderText("e.g., Google, Company VPN, Database Server")
+        self.service_input.setPlaceholderText("Enter service name (e.g., Google, Amazon)")
+        if self.entry:
+            self.service_input.setText(self.entry['service'])
+            self.service_input.setEnabled(False if self.entry else True)
+        form_layout.addRow("Service:", self.service_input)
+        
+        # Username input
         self.username_input = QLineEdit()
-        self.username_input.setPlaceholderText("Your username or email")
-        self.password_input = QLineEdit()
-        self.password_input.setPlaceholderText("Enter or generate password")
-        self.password_input.setEchoMode(QLineEdit.EchoMode.Password) # Hide password by default
-
-        form_layout.addWidget(QLabel("Service/Website:"))
-        form_layout.addWidget(self.service_input)
-        form_layout.addWidget(QLabel("Username:"))
-        form_layout.addWidget(self.username_input)
-        form_layout.addWidget(QLabel("Password:"))
+        self.username_input.setPlaceholderText("Enter username or email")
+        if self.entry:
+            self.username_input.setText(self.entry['username'])
+            self.username_input.setEnabled(False if self.entry else True)
+        form_layout.addRow("Username:", self.username_input)
         
-        # Password row with Show/Hide toggle
+        # Password input layout (field + generate button + show button)
         password_row_layout = QHBoxLayout()
-        password_row_layout.addWidget(self.password_input)
-        self.show_pass_button = QPushButton("Show") # Renamed variable
-        self.show_pass_button.setObjectName("show_pass_button") # Add object name for QSS
-        self.show_pass_button.setCheckable(True)
-        self.show_pass_button.toggled.connect(self.toggle_password_visibility)
-        password_row_layout.addWidget(self.show_pass_button) # Use renamed variable
-        form_layout.addLayout(password_row_layout)
 
-        # Password Generation Section
-        gen_group_layout = QHBoxLayout()
-        gen_options_layout = QVBoxLayout() 
-        
-        # Length SpinBox
-        len_layout = QHBoxLayout()
-        len_layout.addWidget(QLabel("Length:"))
-        self.length_spinbox = QSpinBox()
-        self.length_spinbox.setRange(8, 128) # Sensible range
-        self.length_spinbox.setValue(16) # Default length
-        len_layout.addWidget(self.length_spinbox)
-        len_layout.addStretch()
-        gen_options_layout.addLayout(len_layout)
+        self.password_input = QLineEdit()
+        self.password_input.setPlaceholderText("Enter password or generate")
+        self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        if self.entry:
+            self.password_input.setText(self.entry['password'])
+        password_row_layout.addWidget(self.password_input, 1)
 
-        # Character Type Checkboxes
-        self.lower_check = QCheckBox("Lowercase (abc)")
-        self.lower_check.setChecked(True)
-        self.upper_check = QCheckBox("Uppercase (ABC)")
-        self.upper_check.setChecked(True)
-        self.digit_check = QCheckBox("Digits (123)")
-        self.digit_check.setChecked(True)
-        self.symbol_check = QCheckBox("Symbols (!@#)")
-        self.symbol_check.setChecked(True)
-        gen_options_layout.addWidget(self.lower_check)
-        gen_options_layout.addWidget(self.upper_check)
-        gen_options_layout.addWidget(self.digit_check)
-        gen_options_layout.addWidget(self.symbol_check)
-        
-        gen_group_layout.addLayout(gen_options_layout)
-        
-        # Generate Button (aligned vertically)
-        gen_button_layout = QVBoxLayout()
-        gen_button_layout.addStretch() # Push button down
         self.generate_button = QPushButton("Generate")
+        self.generate_button.setToolTip("Generate a strong password (16 chars)")
         self.generate_button.clicked.connect(self.generate_password)
-        gen_button_layout.addWidget(self.generate_button)
-        gen_button_layout.addStretch() # Center vertically
-        gen_group_layout.addLayout(gen_button_layout)
+        password_row_layout.addWidget(self.generate_button)
+
+        self.show_password_button = QPushButton()
+        self.show_password_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogYesButton))
+        self.show_password_button.setCheckable(True)
+        self.show_password_button.setToolTip("Show/Hide Password")
+        self.show_password_button.toggled.connect(self.toggle_password_visibility)
+        password_row_layout.addWidget(self.show_password_button)
+
+        form_layout.addRow("Password:", password_row_layout)
+
+        # URL input
+        self.url_input = QLineEdit()
+        self.url_input.setPlaceholderText("Enter website URL (optional)")
+        if self.entry and 'url' in self.entry:
+            self.url_input.setText(self.entry['url'])
+        form_layout.addRow("URL:", self.url_input)
         
-        form_layout.addLayout(gen_group_layout)
-        
+        # Notes input (Changed to QTextEdit for multi-line)
+        self.notes_input = QTextEdit()
+        self.notes_input.setPlaceholderText("Enter notes (optional)")
+        self.notes_input.setAcceptRichText(False)
+        self.notes_input.setFixedHeight(80)
+        if self.entry and 'notes' in self.entry:
+            self.notes_input.setPlainText(self.entry['notes'])
+        form_layout.addRow("Notes:", self.notes_input)
+
         layout.addLayout(form_layout)
 
-        # Standard OK/Cancel buttons
-        self.button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        self.button_box.accepted.connect(self.accept)
-        self.button_box.rejected.connect(self.reject)
-        layout.addWidget(self.button_box)
+        # Buttons (OK/Cancel)
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
 
-        # Pre-fill fields if editing an existing entry
-        if self.entry:
-            self.service_input.setText(self.entry.get('service', ''))
-            self.username_input.setText(self.entry.get('username', ''))
-            self.password_input.setText(self.entry.get('password', ''))
-            
+        self.setLayout(layout)
+        self.service_input.setFocus()
+
+    def generate_password(self):
+        """Generates a secure password and updates the input field."""
+        try:
+            generated_pw = self.security_utils.generate_secure_password(length=16)
+            self.password_input.setText(generated_pw)
+            self.show_password_button.setChecked(False)
+            self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        except Exception as e:
+            QMessageBox.warning(self, "Generation Failed", f"Could not generate password: {e}")
+
     def toggle_password_visibility(self, checked):
-        """Toggle the password field echo mode."""
+        """Toggle password visibility"""
         if checked:
             self.password_input.setEchoMode(QLineEdit.EchoMode.Normal)
-            self.show_pass_button.setText("Hide") # Use renamed variable
+            self.show_password_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogNoButton))
         else:
             self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
-            self.show_pass_button.setText("Show") # Use renamed variable
+            self.show_password_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogYesButton))
+
+    def get_entry(self):
+        """Get the entry data from the dialog"""
+        entry = {
+            'service': self.service_input.text().strip(),
+            'username': self.username_input.text().strip(),
+            'password': self.password_input.text(),
+            'url': self.url_input.text().strip(),
+            'notes': self.notes_input.toPlainText().strip()
+        }
+        
+        if not entry['url']:
+            del entry['url']
+        if not entry['notes']:
+            del entry['notes']
             
-    def generate_password(self):
-        """Generate a cryptographically secure password."""
-        if not self.validate_inputs():
-            return
-            
-        length = self.length_spinbox.value()
+        return entry
         
-        # Define character pools with clear separation
-        uppercase = string.ascii_uppercase
-        lowercase = string.ascii_lowercase
-        digits = string.digits
-        special = "!@#$%^&*()_+-=[]{}|;:,.<>?"
-        
-        # Ensure at least one character from each required type
-        password = [
-            secrets.choice(uppercase),
-            secrets.choice(lowercase),
-            secrets.choice(digits),
-            secrets.choice(special)
-        ]
-        
-        # Fill the rest with random characters from all pools
-        all_chars = uppercase + lowercase + digits + special
-        password.extend(secrets.choice(all_chars) for _ in range(length - 4))
-        
-        # Shuffle the password to ensure random distribution
-        secrets.SystemRandom().shuffle(password)
-        
-        # Join the characters into the final password
-        generated_password = ''.join(password)
-        
-        self.password_input.setText(generated_password)
-        # Ensure password visibility is reset if it was shown
-        self.show_pass_button.setChecked(False)
-            
-    def get_data(self) -> dict | None:
-        """Returns the entered data as a dictionary, performs basic validation."""
+    def accept(self):
+        """Validate the entry before accepting"""
         service = self.service_input.text().strip()
         username = self.username_input.text().strip()
-        password = self.password_input.text() # Don't strip password
+        password = self.password_input.text()
 
         if not service:
-            QMessageBox.warning(self, "Input Error", "Service name cannot be empty.")
-            return None
-        # Allow empty username/password, but service is mandatory
+            QMessageBox.warning(self, "Validation Error", "Service name is required.")
+            self.service_input.setFocus()
+            return
             
-        return {
-            "service": service,
-            "username": username,
-            "password": password
-        }
-
-    def check_password_strength(self, password: str) -> None:
-        """Check password strength and update the strength indicator."""
+        if not username:
+            QMessageBox.warning(self, "Validation Error", "Username is required.")
+            self.username_input.setFocus()
+            return
+            
         if not password:
-            self.strength_bar.setValue(0)
-            self.strength_label.setText("Password Strength: Empty")
-            return
-
-        score = 0
-        # Length check (up to 40 points)
-        length_score = min(len(password) * 2, 40)
-        score += length_score
-
-        # Character type checks (15 points each)
-        if any(c.isupper() for c in password):
-            score += 15
-        if any(c.islower() for c in password):
-            score += 15
-        if any(c.isdigit() for c in password):
-            score += 15
-        if any(c in string.punctuation for c in password):
-            score += 15
-
-        # Update UI
-        self.strength_bar.setValue(score)
-        strength_text = "Weak"
-        if score >= 80:
-            strength_text = "Very Strong"
-        elif score >= 60:
-            strength_text = "Strong"
-        elif score >= 40:
-            strength_text = "Medium"
-        self.strength_label.setText(f"Password Strength: {strength_text}")
-
-    def validate_password_strength(self, password: str) -> bool:
-        """Validate password meets minimum security requirements."""
-        if len(password) < 12:
-            QMessageBox.warning(self, "Password Too Weak", 
-                              "Password must be at least 12 characters long.")
-            return False
-        if not any(c.isupper() for c in password):
-            QMessageBox.warning(self, "Password Too Weak", 
-                              "Password must contain at least one uppercase letter.")
-            return False
-        if not any(c.islower() for c in password):
-            QMessageBox.warning(self, "Password Too Weak", 
-                              "Password must contain at least one lowercase letter.")
-            return False
-        if not any(c.isdigit() for c in password):
-            QMessageBox.warning(self, "Password Too Weak", 
-                              "Password must contain at least one number.")
-            return False
-        if not any(c in string.punctuation for c in password):
-            QMessageBox.warning(self, "Password Too Weak", 
-                              "Password must contain at least one special character.")
-            return False
-        return True
-
-    # Override accept to perform validation before closing
-    def accept(self):
-        """Override accept to perform validation before closing."""
-        data = self.get_data()
-        if data is None:
-            return
-        
-        # Validate password strength
-        if not self.validate_password_strength(data['password']):
+            QMessageBox.warning(self, "Validation Error", "Password is required.")
+            self.password_input.setFocus()
             return
             
-        super().accept() 
+        if not self.entry:
+            if any(e['service'] == service and e['username'] == username for e in self.data_manager.get_entries()):
+                QMessageBox.warning(self, "Duplicate Entry",
+                                    f"An entry for service '{service}' with username '{username}' already exists.")
+                self.service_input.setFocus()
+                return
+
+        super().accept()
+
+# --- Application Controller Logic --- 
+
+# Global variable to hold the main window instance
+main_app_window = None
+
+def show_login_window():
+    """Shows the login window."""
+    global login_window
+    if setup_window:
+        setup_window.hide()
+    login_window.show()
+
+def show_setup_window():
+    """Shows the setup window."""
+    global setup_window, login_window
+    app = QApplication.instance()
+    if not setup_window:
+        setup_window = SetupWindow(app.data_manager)
+        setup_window.setup_complete.connect(on_setup_complete)
+        setup_window.show_login.connect(show_login_window)
+    login_window.hide()
+    setup_window.show()
+
+def on_login_success(loaded_data, master_password):
+    """Handles successful login."""
+    global main_app_window, login_window
+    print("Login successful, showing main window.")
+    app = QApplication.instance()
+
+    try:
+        salt = app.data_manager.get_salt()
+        if salt:
+            app.audit_logger.set_credentials(master_password, salt)
+        else:
+            app.audit_logger.log_event("AUDIT_INIT_ERROR", "Could not retrieve salt after login.")
+    except Exception as e:
+        print(f"Error setting audit logger credentials after login: {e}")
+        if app.audit_logger._initialized:
+             app.audit_logger.log_event("AUDIT_INIT_ERROR", f"Exception setting credentials: {e}")
+
+    if not main_app_window:
+        main_app_window = MainWindow(app.audit_logger, app.data_manager, loaded_data, master_password)
+    else:
+        main_app_window.master_password = master_password
+        app.data_manager.set_master_password(master_password)
+        main_app_window.set_initial_data(loaded_data)
+
+    login_window.hide()
+    main_app_window.show()
+    main_app_window.raise_()
+    main_app_window.activateWindow()
+
+def on_setup_complete(master_password):
+    """Handles successful setup."""
+    global main_app_window, setup_window
+    print("Setup complete, showing main window.")
+    app = QApplication.instance()
+
+    app.data_manager.set_master_password(master_password)
+
+    try:
+        salt = app.data_manager.get_salt()
+        if salt:
+            app.audit_logger.set_credentials(master_password, salt)
+        else:
+             print("AuditLogger: Could not retrieve salt after setup.")
+    except Exception as e:
+        print(f"Error setting audit logger credentials after setup: {e}")
+
+    if not main_app_window:
+        main_app_window = MainWindow(app.audit_logger, app.data_manager, master_password=master_password)
+
+    main_app_window.set_initial_data([])
+
+    setup_window.hide()
+    main_app_window.show()
+    main_app_window.raise_()
+    main_app_window.activateWindow()
+
+# --- Main Execution --- 
+
+# Global references to windows
+login_window = None
+setup_window = None
+
+def main():
+    """Main entry point for the LCG Password Manager GUI."""
+    global login_window, setup_window, main_app_window
+
+    # Enable high DPI scaling for better look on modern displays
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+
+    app = QApplication(sys.argv)
+    app.setStyle('Fusion')
+
+    # Instantiate core components and make them accessible
+    app.audit_logger = AuditLogger()
+    app.data_manager = DataManager(audit_logger=app.audit_logger)
+    app.security_utils = SecurityUtils()
+    app.branding = Branding()
+
+    # Determine if vault exists using the app's data_manager
+    vault_path = app.data_manager.vault_path
+    vault_exists = vault_path.exists()
+
+    # Pass the single audit_logger and data_manager instances
+    login_window = LoginWindow(app.audit_logger, app.data_manager)
+    login_window.login_successful.connect(on_login_success)
+    login_window.show_setup.connect(show_setup_window)
+
+    if vault_exists:
+        print(f"Vault found at {vault_path}, showing login window.")
+        login_window.show()
+    else:
+        print(f"Vault not found at {vault_path}, showing setup window.")
+        show_setup_window()
+
+    sys.exit(app.exec()) 
+
+class SettingsDialog(QDialog):
+    """Dialog for managing application settings"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.branding = Branding() # Add branding for styling
+        self.setup_ui()
+        self.load_styles() # Load styles
+
+    def load_styles(self):
+        """Load stylesheet from Branding."""
+        self.setStyleSheet(self.branding.get_stylesheet())
+        # Apply specific styles if needed, e.g., make QGroupBox title bolder
+        self.findChild(QGroupBox, "changePasswordGroup").setStyleSheet("QGroupBox { font-weight: bold; }")
+
+    def setup_ui(self):
+        """Set up the dialog's user interface"""
+        self.setWindowTitle("Settings")
+        self.setModal(True)
+        
+        layout = QVBoxLayout()
+        form_layout = QFormLayout()
+        
+        # Master password change section
+        group_box = QGroupBox("Change Master Password")
+        group_box.setObjectName("changePasswordGroup") # Add object name for styling
+        group_layout = QVBoxLayout()
+        
+        # Current password
+        self.current_password = QLineEdit()
+        self.current_password.setPlaceholderText("Enter current master password")
+        self.current_password.setEchoMode(QLineEdit.EchoMode.Password)
+        group_layout.addWidget(QLabel("Current Password:"))
+        group_layout.addWidget(self.current_password)
+        
+        # New password
+        self.new_password = QLineEdit()
+        self.new_password.setPlaceholderText("Enter new master password")
+        self.new_password.setEchoMode(QLineEdit.EchoMode.Password)
+        group_layout.addWidget(QLabel("New Password:"))
+        group_layout.addWidget(self.new_password)
+        
+        # Confirm new password
+        self.confirm_password = QLineEdit()
+        self.confirm_password.setPlaceholderText("Confirm new master password")
+        self.confirm_password.setEchoMode(QLineEdit.EchoMode.Password)
+        group_layout.addWidget(QLabel("Confirm Password:"))
+        group_layout.addWidget(self.confirm_password)
+        
+        # Show password checkboxes
+        show_layout = QHBoxLayout()
+        
+        self.show_current = QCheckBox("Show Current")
+        self.show_current.stateChanged.connect(lambda state: self.toggle_password_visibility(self.current_password, state))
+        show_layout.addWidget(self.show_current)
+        
+        self.show_new = QCheckBox("Show New")
+        self.show_new.stateChanged.connect(lambda state: self.toggle_password_visibility(self.new_password, state))
+        show_layout.addWidget(self.show_new)
+        
+        self.show_confirm = QCheckBox("Show Confirm")
+        self.show_confirm.stateChanged.connect(lambda state: self.toggle_password_visibility(self.confirm_password, state))
+        show_layout.addWidget(self.show_confirm)
+        
+        group_layout.addLayout(show_layout)
+        group_box.setLayout(group_layout)
+        layout.addWidget(group_box)
+        
+        # Audit log settings
+        log_group = QGroupBox("Audit Log Settings")
+        log_layout = QFormLayout()
+        
+        # Max log age
+        self.max_log_age = QSpinBox()
+        self.max_log_age.setRange(1, 365)
+        self.max_log_age.setValue(30)  # Default 30 days
+        self.max_log_age.setSuffix(" days")
+        log_layout.addRow("Maximum Log Age:", self.max_log_age)
+        
+        # Log rotation size
+        self.rotation_size = QSpinBox()
+        self.rotation_size.setRange(1, 100)
+        self.rotation_size.setValue(10)  # Default 10 MB
+        self.rotation_size.setSuffix(" MB")
+        log_layout.addRow("Log Rotation Size:", self.rotation_size)
+        
+        log_group.setLayout(log_layout)
+        layout.addWidget(log_group)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        save_button = QPushButton("Save")
+        save_button.clicked.connect(self.save_settings)
+        save_button.setDefault(True)
+        
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(self.reject)
+        
+        button_layout.addWidget(save_button)
+        button_layout.addWidget(cancel_button)
+        layout.addLayout(button_layout)
+        
+        self.setLayout(layout)
+        
+    def toggle_password_visibility(self, password_input, state):
+        """Toggle password visibility for the given input field"""
+        password_input.setEchoMode(QLineEdit.EchoMode.Normal if state else QLineEdit.EchoMode.Password)
+    
+    def save_settings(self):
+        """Save the settings."""
+        try:
+            # Get password fields
+            current_password = self.current_password.text()
+            new_password = self.new_password.text()
+            confirm_password = self.confirm_password.text()
+            
+            password_change_attempted = bool(current_password or new_password or confirm_password)
+            
+            if password_change_attempted:
+                # If attempting to change password, all fields must be filled
+                if not current_password or not new_password or not confirm_password:
+                    QMessageBox.warning(
+                        self,
+                        "Validation Error",
+                        "To change the master password, please fill in all three password fields."
+                    )
+                    return # Keep dialog open
+
+                # Validate new passwords match
+                if new_password != confirm_password:
+                    QMessageBox.warning(
+                        self,
+                        "Validation Error",
+                        "New passwords do not match."
+                    )
+                    self.new_password.setFocus()
+                    return # Keep dialog open
+                
+                # Validate current password with DataManager
+                # Assuming parent is MainWindow which has data_manager
+                if not self.parent().data_manager.validate_password(current_password):
+                    QMessageBox.warning(
+                        self,
+                        "Validation Error",
+                        "Current password is incorrect."
+                    )
+                    self.current_password.setFocus()
+                    return # Keep dialog open
+                
+                # --- Check password strength (reuse AddEditDialog logic if available or implement here) ---
+                # Example using zxcvbn if integrated:
+                # from zxcvbn import zxcvbn
+                # results = zxcvbn(new_password)
+                # if results['score'] < 3: # Example: Require score 3 or higher
+                #     QMessageBox.warning(self, "Weak Password", 
+                #                         f"New password is too weak. {results['feedback'].get('warning', '')} "
+                #                         f"{', '.join(results['feedback'].get('suggestions', []))}")
+                #     self.new_password.setFocus()
+                #     return # Keep dialog open
+                
+                # --- If all validations pass, update the master password ---
+                try:
+                    self.parent().data_manager.update_master_password(new_password)
+                    # Update the master password stored in MainWindow as well
+                    self.parent().master_password = new_password 
+                    
+                    QMessageBox.information(
+                        self,
+                        "Success",
+                        "Master password updated successfully."
+                    )
+                    self.parent().audit_logger.log_event("MASTER_PASSWORD_CHANGED", "Master password was changed successfully.")
+                    self.accept() # Close dialog only on success
+                
+                except Exception as e:
+                     QMessageBox.critical(self, "Error", f"Failed to update master password: {str(e)}")
+                     self.parent().audit_logger.log_event("MASTER_PASSWORD_CHANGE_ERROR", f"Failed to update: {str(e)}")
+                     # Optionally keep dialog open or close depending on error severity
+            
+            else:
+                # No password change attempted, just close the dialog
+                self.accept() 
+                
+        except Exception as e:
+            # Catch unexpected errors during the process
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"An error occurred while saving settings: {str(e)}"
+            )
+            # Log this unexpected error
+            if hasattr(self, 'parent') and hasattr(self.parent(), 'audit_logger'):
+                 self.parent().audit_logger.log_event("SETTINGS_SAVE_ERROR", f"Unexpected error: {str(e)}") 
+
+class HelpDialog(QDialog):
+    """Dialog to display the user guide."""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.branding = Branding()
+        self.setupUi()
+        
+        # Apply the current theme
+        self.setStyleSheet(self.branding.get_stylesheet())
+
+    def setupUi(self):
+        """Set up the user interface."""
+        self.setWindowTitle("LCG Password Manager - User Guide")
+        self.resize(800, 600)
+        
+        # Main layout
+        layout = QVBoxLayout()
+        
+        # Create text browser for displaying the guide
+        self.textBrowser = QTextBrowser()
+        self.textBrowser.setOpenExternalLinks(True)
+        self.textBrowser.setStyleSheet("""
+            QTextBrowser {
+                background-color: white;
+                color: #333333;
+                border: 1px solid #cccccc;
+                padding: 10px;
+            }
+        """)
+        layout.addWidget(self.textBrowser)
+        
+        # Add close button at the bottom
+        buttonLayout = QHBoxLayout()
+        closeButton = QPushButton("Close")
+        closeButton.clicked.connect(self.accept)
+        buttonLayout.addStretch()
+        buttonLayout.addWidget(closeButton)
+        layout.addLayout(buttonLayout)
+        
+        self.setLayout(layout)
+        
+        # Load the user guide
+        self.loadUserGuide()
+        
+    def loadUserGuide(self):
+        """Load and render the user guide markdown file."""
+        try:
+            # Path to the user guide markdown file
+            guide_path = Path(__file__).parent.parent.parent / "docs" / "USER_GUIDE.md"
+            
+            if guide_path.exists():
+                # Read the markdown content
+                with open(guide_path, 'r', encoding='utf-8') as f:
+                    md_content = f.read()
+                
+                # Convert markdown to HTML
+                html_content = markdown.markdown(md_content)
+                
+                # Get theme colors
+                theme_colors = self.branding.theme_manager.get_theme_colors()
+                is_dark = self.branding.theme_manager.current_theme == "dark"
+                
+                # Background and text colors based on theme
+                bg_color = "#f8f8f8" if not is_dark else "#3E3E42"
+                text_color = "#333" if not is_dark else "#ffffff"
+                code_bg = "#e8e8e8" if not is_dark else "#2D2D30"
+                border_color = "#ddd" if not is_dark else "#545454"
+                
+                # Add some CSS for nicer display
+                styled_html = f"""
+                <html>
+                <head>
+                <style>
+                    body {{ 
+                        font-family: 'Segoe UI', Arial, sans-serif; 
+                        line-height: 1.6; 
+                        margin: 30px; 
+                        color: {text_color}; 
+                        background-color: {bg_color};
+                        padding: 20px;
+                        border-radius: 8px;
+                    }}
+                    h1, h2, h3, h4 {{ 
+                        color: {theme_colors['primary']}; 
+                        margin-top: 24px;
+                        margin-bottom: 16px;
+                    }}
+                    h1 {{ 
+                        border-bottom: 2px solid {theme_colors['primary']}; 
+                        padding-bottom: 10px; 
+                        font-size: 28px;
+                    }}
+                    h2 {{ 
+                        border-bottom: 1px solid {border_color}; 
+                        padding-bottom: 5px; 
+                        font-size: 22px;
+                    }}
+                    p {{
+                        margin: 12px 0;
+                    }}
+                    code {{ 
+                        background: {code_bg}; 
+                        padding: 2px 5px; 
+                        border-radius: 3px; 
+                        font-family: Consolas, monospace;
+                        color: {text_color};
+                    }}
+                    pre {{ 
+                        background: {code_bg}; 
+                        padding: 15px; 
+                        border-radius: 5px; 
+                        overflow-x: auto;
+                        border: 1px solid {border_color};
+                    }}
+                    ul, ol {{ 
+                        padding-left: 25px; 
+                        margin: 15px 0;
+                    }}
+                    li {{ 
+                        margin-bottom: 8px; 
+                    }}
+                    a {{ 
+                        color: {theme_colors['primary']}; 
+                        text-decoration: none; 
+                        font-weight: bold;
+                    }}
+                    a:hover {{ 
+                        text-decoration: underline; 
+                    }}
+                    blockquote {{ 
+                        background: {code_bg}; 
+                        border-left: 5px solid {theme_colors['primary']}; 
+                        margin: 15px 0; 
+                        padding: 15px; 
+                    }}
+                    table {{ 
+                        border-collapse: collapse; 
+                        width: 100%;
+                        margin: 20px 0;
+                    }}
+                    th, td {{ 
+                        border: 1px solid {border_color}; 
+                        padding: 10px; 
+                        text-align: left; 
+                    }}
+                    th {{ 
+                        background-color: {theme_colors['primary']}; 
+                        color: white; 
+                    }}
+                    tr:nth-child(even) {{ 
+                        background-color: {code_bg}; 
+                    }}
+                </style>
+                </head>
+                <body>
+                {html_content}
+                </body>
+                </html>
+                """
+                
+                # Set the HTML content to the text browser
+                self.textBrowser.setHtml(styled_html)
+            else:
+                self.textBrowser.setPlainText("User guide not found.")
+        except Exception as e:
+            self.textBrowser.setPlainText(f"Error loading user guide: {str(e)}") 
